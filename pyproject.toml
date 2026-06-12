@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-ssh-mcp"
+version = "0.1.0"
+description = "Local MCP server for approved diagnostic SSH access to one embedded Linux/BusyBox device."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "keyring>=25.0.0",
+  "mcp>=1.2.0",
+  "paramiko>=3.4.0",
+]
+
+[project.optional-dependencies]
+test = []
+
+[project.scripts]
+ai-ssh-mcp = "ai_ssh_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
