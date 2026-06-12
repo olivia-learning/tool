@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import stat
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from posixpath import basename as posix_basename
 
 from .config import DeviceConfig
 from .credentials import DeviceSecrets
@@ -22,6 +25,21 @@ class ConnectionCheck:
     message: str
     username_output: str = ""
     root_check_output: str = ""
+
+
+@dataclass(frozen=True)
+class DownloadedFile:
+    remote_path: str
+    local_path: str
+    size_bytes: int
+    ok: bool
+    message: str = ""
+
+
+SENSITIVE_REMOTE_PATH_PATTERN = re.compile(
+    r"(^|/)(shadow|gshadow|sudoers)$|(^|/)(\.ssh|ssl/private)(/|$)|(^|/)proc/kcore$",
+    re.IGNORECASE,
+)
 
 
 class EmbeddedSSHSession:
@@ -113,6 +131,51 @@ class EmbeddedSSHSession:
             timeout=self.config.command_timeout,
         )
 
+    def download_files_sftp(
+        self,
+        remote_paths: list[str],
+        local_dir: str,
+        max_bytes_per_file: int = 50 * 1024 * 1024,
+    ) -> list[DownloadedFile]:
+        if not remote_paths:
+            raise ValueError("remote_paths is required")
+        if max_bytes_per_file <= 0:
+            raise ValueError("max_bytes_per_file must be positive")
+        client = self._require_client()
+        target_dir = Path(local_dir).expanduser().resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        results: list[DownloadedFile] = []
+        sftp = client.open_sftp()
+        try:
+            used_names: set[str] = set()
+            for remote_path in remote_paths:
+                validate_remote_file_path(remote_path)
+                filename = safe_local_filename(remote_path)
+                filename = unique_filename(filename, used_names)
+                used_names.add(filename)
+                local_path = target_dir / filename
+                attrs = sftp.stat(remote_path)
+                if stat.S_ISDIR(attrs.st_mode):
+                    raise ValueError(f"Remote path is a directory, not a file: {remote_path}")
+                size = int(attrs.st_size or 0)
+                if size > max_bytes_per_file:
+                    raise ValueError(
+                        f"Remote file is {size} bytes, above max_bytes_per_file={max_bytes_per_file}: {remote_path}"
+                    )
+                sftp.get(remote_path, str(local_path))
+                results.append(
+                    DownloadedFile(
+                        remote_path=remote_path,
+                        local_path=str(local_path),
+                        size_bytes=size,
+                        ok=True,
+                    )
+                )
+        finally:
+            sftp.close()
+        return results
+
     def close(self) -> None:
         if self._channel is not None:
             self._channel.close()
@@ -169,6 +232,11 @@ class EmbeddedSSHSession:
             raise SSHExecutionError("SSH channel is not connected.")
         return self._channel
 
+    def _require_client(self):
+        if self._client is None:
+            raise SSHExecutionError("SSH client is not connected.")
+        return self._client
+
     def _read_until_quiet(self, timeout: int) -> str:
         channel = self._require_channel()
         deadline = time.monotonic() + timeout
@@ -223,3 +291,42 @@ def remove_echoed_marker_command(body: str, marker: str) -> str:
         cleaned.append(line)
     return "\n".join(cleaned)
 
+
+def validate_remote_file_path(remote_path: str) -> None:
+    if not remote_path or not remote_path.strip():
+        raise ValueError("remote path is required")
+    if "\x00" in remote_path or "\n" in remote_path or "\r" in remote_path:
+        raise ValueError("remote path must be a single path")
+    if "*" in remote_path or "?" in remote_path or "[" in remote_path or "]" in remote_path:
+        raise ValueError("remote path wildcards are not allowed; pass explicit file paths")
+    normalized = remote_path.strip().replace("\\", "/")
+    if not normalized.startswith("/"):
+        raise ValueError("remote path must be absolute")
+    parts = [part for part in normalized.split("/") if part]
+    if any(part == ".." for part in parts):
+        raise ValueError("remote path must not contain '..'")
+    if SENSITIVE_REMOTE_PATH_PATTERN.search(normalized):
+        raise ValueError(f"remote path is blocked as sensitive: {remote_path}")
+
+
+def safe_local_filename(remote_path: str) -> str:
+    filename = posix_basename(remote_path.strip().replace("\\", "/"))
+    if not filename or filename in {".", ".."}:
+        raise ValueError(f"remote path does not contain a file name: {remote_path}")
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
+    if not sanitized:
+        raise ValueError(f"remote file name is not usable locally: {remote_path}")
+    return sanitized
+
+
+def unique_filename(filename: str, used_names: set[str]) -> str:
+    if filename not in used_names:
+        return filename
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    counter = 2
+    while True:
+        candidate = f"{stem}_{counter}{suffix}"
+        if candidate not in used_names:
+            return candidate
+        counter += 1

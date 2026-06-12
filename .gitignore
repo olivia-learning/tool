@@ -15,6 +15,7 @@ env/
 .ai_ssh_mcp/
 config.json
 state.json
+allowlist.json
 *.tmp
 
 # Editor and OS files
@@ -22,4 +23,3 @@ state.json
 .idea/
 .DS_Store
 Thumbs.db
-

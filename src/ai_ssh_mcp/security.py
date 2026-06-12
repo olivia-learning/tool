@@ -6,16 +6,32 @@ import re
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable
+
+from .config import app_home, write_json_atomic
 
 
 OUTPUT_LIMIT_CHARS = 12000
+CUSTOM_COMMAND_PREFIX = "custom:"
 
 
 @dataclass(frozen=True)
 class DiagnosticCommand:
     command: str
     purpose: str
+
+
+@dataclass(frozen=True)
+class AllowlistCommand:
+    command_id: str
+    command: str
+    purpose: str
+    source: str
+    enabled: bool = True
+
+    def to_diagnostic_command(self) -> DiagnosticCommand:
+        return DiagnosticCommand(command=self.command, purpose=self.purpose)
 
 
 @dataclass(frozen=True)
@@ -111,9 +127,196 @@ PROFILE_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 DANGEROUS_PATTERN = re.compile(
     r"(^|\s)(rm|reboot|poweroff|halt|shutdown|mkfs|dd|mount\s+-o\s+remount|vi|vim|nano|sed\s+-i)\b|"
-    r"(>|>>|\|\s*(sh|bash|ash)\b|;\s*(rm|reboot|poweroff|halt|shutdown)\b)",
+    r"(>|>>|\|\s*(sh|bash|ash)\b|;|&&|\|\||`|\$\()",
     re.IGNORECASE,
 )
+
+SENSITIVE_COMMAND_PATH_PATTERN = re.compile(
+    r"(^|\s)(/etc/shadow|/etc/gshadow|/etc/sudoers|/proc/kcore)(\s|$)|"
+    r"(^|\s)(/root/\.ssh|/home/[^/\s]+/\.ssh|/etc/ssh|/etc/ssl/private)(/|\s|$)",
+    re.IGNORECASE,
+)
+
+
+def allowlist_path() -> Path:
+    return app_home() / "allowlist.json"
+
+
+def _load_allowlist_state(path: Path | None = None) -> dict:
+    target = path or allowlist_path()
+    if not target.exists():
+        return {"custom": {}, "disabled_builtin_ids": []}
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    raw.setdefault("custom", {})
+    raw.setdefault("disabled_builtin_ids", [])
+    return raw
+
+
+def _save_allowlist_state(state: dict, path: Path | None = None) -> None:
+    write_json_atomic(path or allowlist_path(), state)
+
+
+def make_custom_command_id(command: str) -> str:
+    digest = hashlib.sha256(command.strip().encode("utf-8")).hexdigest()[:16]
+    return f"{CUSTOM_COMMAND_PREFIX}{digest}"
+
+
+def normalize_command(command: str) -> str:
+    return " ".join(command.strip().split())
+
+
+def builtin_allowlist_commands(include_disabled: bool = True) -> list[AllowlistCommand]:
+    state = _load_allowlist_state()
+    disabled = set(state["disabled_builtin_ids"])
+    entries: list[AllowlistCommand] = []
+    for command_id, command in COMMAND_CATALOG.items():
+        enabled = command_id not in disabled
+        if include_disabled or enabled:
+            entries.append(
+                AllowlistCommand(
+                    command_id=command_id,
+                    command=command.command,
+                    purpose=command.purpose,
+                    source="builtin",
+                    enabled=enabled,
+                )
+            )
+    return entries
+
+
+def custom_allowlist_commands(include_disabled: bool = True) -> list[AllowlistCommand]:
+    state = _load_allowlist_state()
+    entries: list[AllowlistCommand] = []
+    for command_id, raw in sorted(state["custom"].items()):
+        enabled = bool(raw.get("enabled", True))
+        if include_disabled or enabled:
+            entries.append(
+                AllowlistCommand(
+                    command_id=command_id,
+                    command=raw["command"],
+                    purpose=raw["purpose"],
+                    source="custom",
+                    enabled=enabled,
+                )
+            )
+    return entries
+
+
+def list_allowlist_commands(include_disabled: bool = True) -> list[AllowlistCommand]:
+    return builtin_allowlist_commands(include_disabled=include_disabled) + custom_allowlist_commands(
+        include_disabled=include_disabled
+    )
+
+
+def effective_command_catalog() -> dict[str, DiagnosticCommand]:
+    return {
+        entry.command_id: entry.to_diagnostic_command()
+        for entry in list_allowlist_commands(include_disabled=False)
+    }
+
+
+def add_allowlist_commands(commands: list[dict[str, str]]) -> dict:
+    if not commands:
+        raise ValueError("commands is required")
+    state = _load_allowlist_state()
+    disabled = set(state["disabled_builtin_ids"])
+    added: list[dict] = []
+    reenabled: list[dict] = []
+    unchanged: list[dict] = []
+
+    builtin_by_command = {
+        normalize_command(command.command): command_id
+        for command_id, command in COMMAND_CATALOG.items()
+    }
+    custom_by_command = {
+        normalize_command(raw["command"]): command_id
+        for command_id, raw in state["custom"].items()
+    }
+
+    for item in commands:
+        command = normalize_command(item.get("command", ""))
+        purpose = item.get("purpose", "").strip() or "自定义只读诊断命令"
+        validate_command_safety(command)
+
+        builtin_id = builtin_by_command.get(command)
+        if builtin_id:
+            if builtin_id in disabled:
+                disabled.remove(builtin_id)
+                reenabled.append({"command_id": builtin_id, "command": command, "source": "builtin"})
+            else:
+                unchanged.append({"command_id": builtin_id, "command": command, "source": "builtin"})
+            continue
+
+        custom_id = custom_by_command.get(command) or make_custom_command_id(command)
+        existing = state["custom"].get(custom_id)
+        if existing and existing.get("enabled", True):
+            unchanged.append({"command_id": custom_id, "command": command, "source": "custom"})
+            continue
+
+        state["custom"][custom_id] = {
+            "command": command,
+            "purpose": purpose,
+            "enabled": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        added.append({"command_id": custom_id, "command": command, "source": "custom"})
+
+    state["disabled_builtin_ids"] = sorted(disabled)
+    _save_allowlist_state(state)
+    return {"added": added, "reenabled": reenabled, "unchanged": unchanged}
+
+
+def delete_allowlist_commands(
+    command_ids: list[str] | None = None, commands: list[str] | None = None
+) -> dict:
+    identifiers = [value for value in (command_ids or []) if value]
+    command_values = [normalize_command(value) for value in (commands or []) if value]
+    if not identifiers and not command_values:
+        raise ValueError("command_ids or commands is required")
+
+    state = _load_allowlist_state()
+    disabled = set(state["disabled_builtin_ids"])
+    custom_by_command = {
+        normalize_command(raw["command"]): command_id
+        for command_id, raw in state["custom"].items()
+    }
+    builtin_by_command = {
+        normalize_command(command.command): command_id
+        for command_id, command in COMMAND_CATALOG.items()
+    }
+    identifiers.extend(custom_by_command[value] for value in command_values if value in custom_by_command)
+    identifiers.extend(builtin_by_command[value] for value in command_values if value in builtin_by_command)
+
+    deleted: list[dict] = []
+    disabled_builtin: list[dict] = []
+    not_found: list[str] = []
+    for command_id in dedupe(identifiers):
+        if command_id in state["custom"]:
+            raw = state["custom"].pop(command_id)
+            deleted.append({"command_id": command_id, "command": raw["command"], "source": "custom"})
+        elif command_id in COMMAND_CATALOG:
+            disabled.add(command_id)
+            command = COMMAND_CATALOG[command_id]
+            disabled_builtin.append(
+                {"command_id": command_id, "command": command.command, "source": "builtin"}
+            )
+        else:
+            not_found.append(command_id)
+
+    state["disabled_builtin_ids"] = sorted(disabled)
+    _save_allowlist_state(state)
+    return {"deleted": deleted, "disabled_builtin": disabled_builtin, "not_found": not_found}
+
+
+def validate_command_safety(command: str) -> None:
+    if not command:
+        raise ValueError("command is required")
+    if "\x00" in command or "\n" in command or "\r" in command:
+        raise ValueError("Command must be a single shell line.")
+    if DANGEROUS_PATTERN.search(command):
+        raise ValueError(f"Command is dangerous: {command}")
+    if SENSITIVE_COMMAND_PATH_PATTERN.search(command):
+        raise ValueError(f"Command reads a blocked sensitive path: {command}")
 
 
 def select_profiles(task: str) -> list[str]:
@@ -127,13 +330,20 @@ def select_profiles(task: str) -> list[str]:
     return selected
 
 
-def generate_plan(task: str) -> DiagnosticPlan:
+def generate_plan(task: str, command_ids: list[str] | None = None) -> DiagnosticPlan:
     if not task or not task.strip():
         raise ValueError("task is required")
-    command_ids = list(BASE_PROFILE)
+    catalog = effective_command_catalog()
+    selected_ids = list(BASE_PROFILE)
     for profile in select_profiles(task):
-        command_ids.extend(PROFILE_COMMANDS[profile])
-    commands = [COMMAND_CATALOG[command_id] for command_id in dedupe(command_ids)]
+        selected_ids.extend(PROFILE_COMMANDS[profile])
+    if command_ids:
+        missing = [command_id for command_id in command_ids if command_id not in catalog]
+        if missing:
+            raise ValueError(f"Unknown or disabled command_id values: {missing}")
+        selected_ids.extend(command_ids)
+    requested_ids = dedupe(selected_ids)
+    commands = [catalog[command_id] for command_id in requested_ids if command_id in catalog]
     validate_commands(commands)
     command_hash = hash_commands(commands)
     return DiagnosticPlan(
@@ -169,12 +379,11 @@ def hash_commands(commands: list[DiagnosticCommand]) -> str:
 
 
 def validate_commands(commands: list[DiagnosticCommand]) -> None:
-    allowed = {command.command for command in COMMAND_CATALOG.values()}
+    allowed = {command.command for command in effective_command_catalog().values()}
     for command in commands:
+        validate_command_safety(command.command)
         if command.command not in allowed:
             raise ValueError(f"Command is not in allowlist: {command.command}")
-        if DANGEROUS_PATTERN.search(command.command):
-            raise ValueError(f"Command is dangerous: {command.command}")
 
 
 def verify_plan_integrity(plan: DiagnosticPlan) -> None:
@@ -191,4 +400,3 @@ def truncate_output(value: str, limit: int = OUTPUT_LIMIT_CHARS) -> tuple[str, b
         return value, False
     marker = f"\n\n[truncated to {limit} characters]\n"
     return value[:limit] + marker, True
-

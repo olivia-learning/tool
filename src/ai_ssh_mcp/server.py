@@ -6,7 +6,13 @@ from typing import Any
 
 from .config import DeviceConfig, load_config, save_config
 from .credentials import CredentialStore
-from .security import generate_plan, verify_plan_integrity
+from .security import (
+    add_allowlist_commands,
+    delete_allowlist_commands,
+    generate_plan,
+    list_allowlist_commands,
+    verify_plan_integrity,
+)
 from .ssh_client import EmbeddedSSHSession
 from .store import AuditStore, make_run_record
 
@@ -53,8 +59,36 @@ def test_connection() -> dict[str, Any]:
     return asdict(result)
 
 
-def plan_diagnostic_task(task: str) -> dict[str, Any]:
-    plan = generate_plan(task)
+def list_whitelist_commands(include_disabled: bool = True) -> dict[str, Any]:
+    commands = [
+        {
+            "command_id": item.command_id,
+            "command": item.command,
+            "purpose": item.purpose,
+            "source": item.source,
+            "enabled": item.enabled,
+        }
+        for item in list_allowlist_commands(include_disabled=include_disabled)
+    ]
+    return {"commands": commands, "count": len(commands)}
+
+
+def add_whitelist_commands(commands: list[dict[str, str]]) -> dict[str, Any]:
+    result = add_allowlist_commands(commands)
+    return {"ok": True, **result}
+
+
+def delete_whitelist_commands(
+    command_ids: list[str] | None = None, commands: list[str] | None = None
+) -> dict[str, Any]:
+    result = delete_allowlist_commands(command_ids=command_ids, commands=commands)
+    return {"ok": True, **result}
+
+
+def plan_diagnostic_task(
+    task: str, command_ids: list[str] | None = None
+) -> dict[str, Any]:
+    plan = generate_plan(task, command_ids=command_ids)
     AuditStore().save_plan(plan)
     return plan.to_dict()
 
@@ -100,6 +134,42 @@ def get_run_detail(run_id: str) -> dict[str, Any]:
     return {"run": AuditStore().get_run(run_id).to_dict()}
 
 
+def download_device_files(
+    remote_paths: list[str],
+    local_dir: str,
+    user_confirmed: bool = False,
+    max_bytes_per_file: int = 50 * 1024 * 1024,
+) -> dict[str, Any]:
+    if not user_confirmed:
+        return {
+            "ok": False,
+            "status": "needs_user_confirmation",
+            "message": "Show the remote file list and local destination to the user first, then call again with user_confirmed=true after they approve it in chat.",
+        }
+
+    config = load_config()
+    secrets = CredentialStore().get_device_secrets(config)
+    with EmbeddedSSHSession(config, secrets) as session:
+        downloaded = session.download_files_sftp(
+            remote_paths=remote_paths,
+            local_dir=local_dir,
+            max_bytes_per_file=max_bytes_per_file,
+        )
+    return {
+        "ok": True,
+        "files": [
+            {
+                "remote_path": item.remote_path,
+                "local_path": item.local_path,
+                "size_bytes": item.size_bytes,
+                "ok": item.ok,
+                "message": item.message,
+            }
+            for item in downloaded
+        ],
+    }
+
+
 def build_mcp_server():
     try:
         from mcp.server.fastmcp import FastMCP
@@ -111,8 +181,12 @@ def build_mcp_server():
     mcp = FastMCP(SERVER_NAME)
     mcp.tool()(configure_device)
     mcp.tool()(test_connection)
+    mcp.tool()(list_whitelist_commands)
+    mcp.tool()(add_whitelist_commands)
+    mcp.tool()(delete_whitelist_commands)
     mcp.tool()(plan_diagnostic_task)
     mcp.tool()(run_approved_plan)
+    mcp.tool()(download_device_files)
     mcp.tool()(list_recent_runs)
     mcp.tool()(get_run_detail)
     return mcp
@@ -120,4 +194,3 @@ def build_mcp_server():
 
 def main() -> None:
     build_mcp_server().run()
-
