@@ -14,6 +14,8 @@
 - `add_whitelist_commands`：新增一批自定义只读白名单命令。
 - `delete_whitelist_commands`：删除自定义白名单命令，或禁用内置白名单命令。
 - `download_device_files`：通过 SFTP over SSH 将设备文件下载到本机指定目录。
+- `run_interactive_tool`：进入指定目录启动交互式后台工具，输入指令并读取提示符前的多行结果。
+- `run_shell_commands`：顺序执行用户确认的普通 shell 命令，并返回每条命令的退出码和输出。
 - `list_recent_runs`：查看最近执行记录。
 - `get_run_detail`：查看某次诊断的完整详情。
 
@@ -187,6 +189,84 @@ user_confirmed = true
 - 会拒绝常见敏感路径，例如 `/etc/shadow`、`.ssh/`、`ssl/private/`、`/proc/kcore`。
 - SFTP 权限通常是 SSH 登录用户权限；如果某些 root-only 文件无法下载，后续可以再加 root shell 打包下载模式。
 
+### 运行交互式后台工具
+
+适合这种手工流程：
+
+```text
+cd /path/to/tool
+./tool_name
+xxx>
+show status
+line 1
+line 2
+xxx>
+```
+
+调用示例：
+
+```text
+use ai_ssh_device。调用 run_interactive_tool：
+work_dir = "/path/to/tool"
+tool_command = "./tool_name"
+inputs = ["show status", "show detail"]
+prompt_pattern = "xxx>$"
+prompt_settle_seconds = 0.8
+user_confirmed = true
+```
+
+读取逻辑：
+
+- 先进入 `work_dir`，再启动 `tool_command`。
+- 等待出现 `prompt_pattern`，例如 `xxx>$`。
+- 每输入一条指令，就持续读取输出。
+- 看到提示符后，不会立刻返回；会继续等待 `prompt_settle_seconds` 秒。
+- 如果这段时间没有新内容，才认为本次输出结束。
+- 返回时会去掉输入回显和最后一个提示符，只保留中间的多行结果。
+
+安全限制：
+
+- `work_dir` 必须是绝对路径。
+- `tool_command` 必须类似 `./tool_name`，只允许简单参数。
+- 每条 `inputs` 只能是一行，不能包含换行。
+- 仍然需要 `user_confirmed=true`。
+- 默认单条输出会按全局输出限制截断，避免超大内容撑爆上下文。
+
+### 运行普通 shell 命令
+
+适合 `pwd`、`ls -l`、`cd /path` 这类普通后台命令。命令会在同一个 root shell 里按顺序执行，所以前一条 `cd` 会影响后一条命令。
+
+调用示例：
+
+```text
+use ai_ssh_device。调用 run_shell_commands：
+commands = ["pwd", "cd /var/log", "ls -l", "cd /path/not-exist"]
+user_confirmed = true
+```
+
+返回结果里每条命令都有：
+
+- `command`：实际执行的命令。
+- `output` / `stdout`：命令产生的输出；在交互式 PTY 里，错误输出通常也会合并到这里。
+- `stderr`：保留字段；多数设备交互 shell 下为空。
+- `exit_status`：退出码，`0` 表示成功，非 `0` 表示失败。
+- `success`：根据 `exit_status == 0` 得出的布尔值。
+- `duration_ms`：耗时。
+- `truncated`：输出是否被截断。
+
+例子：
+
+- `ls -l` 有输出：`output` 会包含文件列表，`exit_status=0`。
+- `cd /var/log` 成功但没有输出：`output=""`，`exit_status=0`，所以你仍然知道它成功了。
+- `cd /not-exist` 失败：`output` 会包含 shell 的错误文本，`exit_status` 通常非 `0`。
+
+安全限制：
+
+- 每条命令只能是一行。
+- 会拦截明显危险命令和命令链，例如 `rm`、`reboot`、`;`、`&&`、`||`、重定向写文件等。
+- 会拦截常见敏感路径读取，例如 `/etc/shadow`、`.ssh/`、`/etc/ssl/private`。
+- 仍然需要 `user_confirmed=true`。
+
 ## 推荐使用流程
 
 1. 调用 `configure_device` 保存设备信息和密码。
@@ -194,7 +274,9 @@ user_confirmed = true
 3. agent 调用 `plan_diagnostic_task` 生成计划，把命令和风险说明展示给用户。
 4. 用户在聊天里确认后，agent 调用 `run_approved_plan`，并传入 `user_confirmed=true`。
 5. 如需下载日志或诊断文件，agent 展示文件列表和目标目录后调用 `download_device_files`，并传入 `user_confirmed=true`。
-6. 查看返回结果，必要时用 `list_recent_runs` 和 `get_run_detail` 追溯。
+6. 如需操作厂商交互式工具，agent 展示目录、工具命令、提示符和输入指令后调用 `run_interactive_tool`。
+7. 如需执行普通 shell 查询命令，agent 展示命令列表后调用 `run_shell_commands`。
+8. 查看返回结果，必要时用 `list_recent_runs` 和 `get_run_detail` 追溯。
 
 ## 安全边界
 
@@ -205,6 +287,8 @@ user_confirmed = true
 - 输出会被截断，避免超大日志撑爆上下文。
 - 第一版虽然登录后立即 `su -`，但仍只允许只读诊断命令。
 - 文件下载必须显式传入 `user_confirmed=true`。
+- 交互式工具执行必须显式传入 `user_confirmed=true`。
+- 普通 shell 命令执行必须显式传入 `user_confirmed=true`。
 
 ## 本地测试
 
@@ -212,4 +296,4 @@ user_confirmed = true
 .\.venv\Scripts\python -m unittest discover
 ```
 
-没有真实设备时，本地测试仍可以覆盖配置、凭据键名、命令白名单、审批哈希、输出截断、计划执行门禁和下载路径校验。
+没有真实设备时，本地测试仍可以覆盖配置、凭据键名、命令白名单、审批哈希、输出截断、计划执行门禁、下载路径校验、交互式输出清洗和普通 shell 命令门禁。

@@ -11,7 +11,7 @@ from posixpath import basename as posix_basename
 
 from .config import DeviceConfig
 from .credentials import DeviceSecrets
-from .security import DiagnosticCommand, truncate_output, validate_commands
+from .security import DiagnosticCommand, truncate_output, validate_command_safety, validate_commands
 from .store import CommandResult
 
 
@@ -36,10 +36,20 @@ class DownloadedFile:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class InteractiveCommandResult:
+    input: str
+    output: str
+    duration_ms: int
+    truncated: bool = False
+
+
 SENSITIVE_REMOTE_PATH_PATTERN = re.compile(
     r"(^|/)(shadow|gshadow|sudoers)$|(^|/)(\.ssh|ssl/private)(/|$)|(^|/)proc/kcore$",
     re.IGNORECASE,
 )
+
+SAFE_TOOL_COMMAND_PATTERN = re.compile(r"^\./[A-Za-z0-9._-]+(?:\s+[A-Za-z0-9._=:/-]+)*$")
 
 
 class EmbeddedSSHSession:
@@ -131,6 +141,19 @@ class EmbeddedSSHSession:
             timeout=self.config.command_timeout,
         )
 
+    def run_shell_commands(
+        self, commands: list[str], command_timeout: int = 30
+    ) -> list[CommandResult]:
+        validate_shell_commands(commands)
+        return [
+            self._run_shell_command(
+                command=command,
+                purpose="用户确认的普通 shell 命令",
+                timeout=command_timeout,
+            )
+            for command in commands
+        ]
+
     def download_files_sftp(
         self,
         remote_paths: list[str],
@@ -174,6 +197,56 @@ class EmbeddedSSHSession:
                 )
         finally:
             sftp.close()
+        return results
+
+    def run_interactive_tool(
+        self,
+        work_dir: str,
+        tool_command: str,
+        inputs: list[str],
+        prompt_pattern: str,
+        startup_timeout: int = 30,
+        command_timeout: int = 30,
+        prompt_settle_seconds: float = 0.8,
+    ) -> list[InteractiveCommandResult]:
+        validate_interactive_tool_request(
+            work_dir=work_dir,
+            tool_command=tool_command,
+            inputs=inputs,
+            prompt_pattern=prompt_pattern,
+            prompt_settle_seconds=prompt_settle_seconds,
+        )
+        channel = self._require_channel()
+        prompt = re.compile(prompt_pattern, re.MULTILINE)
+        self._send_line(f"cd {shell_single_quote(work_dir)}")
+        self._read_until_prompt_quiet(prompt, startup_timeout, prompt_settle_seconds)
+        self._send_line(tool_command)
+        startup_output = self._read_until_prompt_quiet(
+            prompt, startup_timeout, prompt_settle_seconds
+        )
+        if not prompt.search(startup_output):
+            raise SSHExecutionError("Interactive tool prompt was not detected after startup.")
+
+        results: list[InteractiveCommandResult] = []
+        for user_input in inputs:
+            started = time.monotonic()
+            self._send_line(user_input)
+            raw = self._read_until_prompt_quiet(
+                prompt, command_timeout, prompt_settle_seconds
+            )
+            duration_ms = int((time.monotonic() - started) * 1000)
+            output = strip_interactive_echo_and_prompt(raw, user_input, prompt)
+            output, truncated = truncate_output(output)
+            results.append(
+                InteractiveCommandResult(
+                    input=user_input,
+                    output=output,
+                    duration_ms=duration_ms,
+                    truncated=truncated,
+                )
+            )
+        channel.send("\x03")
+        self._read_until_quiet(timeout=1)
         return results
 
     def close(self) -> None:
@@ -237,6 +310,9 @@ class EmbeddedSSHSession:
             raise SSHExecutionError("SSH client is not connected.")
         return self._client
 
+    def _send_line(self, value: str) -> None:
+        self._require_channel().send(value + "\n")
+
     def _read_until_quiet(self, timeout: int) -> str:
         channel = self._require_channel()
         deadline = time.monotonic() + timeout
@@ -268,6 +344,26 @@ class EmbeddedSSHSession:
             else:
                 time.sleep(0.05)
         raise SSHExecutionError(f"Timed out waiting for shell output at {datetime.now(timezone.utc).isoformat()}.")
+
+    def _read_until_prompt_quiet(
+        self, prompt: re.Pattern[str], timeout: int, settle_seconds: float
+    ) -> str:
+        channel = self._require_channel()
+        deadline = time.monotonic() + timeout
+        prompt_seen_at: float | None = None
+        chunks: list[str] = []
+        while time.monotonic() < deadline:
+            if channel.recv_ready():
+                data = channel.recv(65535).decode("utf-8", errors="replace")
+                chunks.append(data)
+                combined = "".join(chunks)
+                if prompt.search(combined):
+                    prompt_seen_at = time.monotonic()
+            elif prompt_seen_at is not None and time.monotonic() - prompt_seen_at >= settle_seconds:
+                return "".join(chunks)
+            else:
+                time.sleep(0.05)
+        raise SSHExecutionError("Timed out waiting for interactive prompt and quiet period.")
 
 
 def parse_marked_output(raw: str, marker: str) -> tuple[str, int]:
@@ -330,3 +426,53 @@ def unique_filename(filename: str, used_names: set[str]) -> str:
         if candidate not in used_names:
             return candidate
         counter += 1
+
+
+def validate_interactive_tool_request(
+    work_dir: str,
+    tool_command: str,
+    inputs: list[str],
+    prompt_pattern: str,
+    prompt_settle_seconds: float,
+) -> None:
+    if not work_dir or not work_dir.startswith("/"):
+        raise ValueError("work_dir must be an absolute path")
+    if "\x00" in work_dir or "\n" in work_dir or "\r" in work_dir or ".." in work_dir.split("/"):
+        raise ValueError("work_dir must be a single safe absolute path")
+    if not SAFE_TOOL_COMMAND_PATTERN.match(tool_command.strip()):
+        raise ValueError("tool_command must look like './tool_name' with simple arguments")
+    if not inputs:
+        raise ValueError("inputs is required")
+    for value in inputs:
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("each input must be one interactive line")
+    if not prompt_pattern:
+        raise ValueError("prompt_pattern is required")
+    if prompt_settle_seconds < 0.1 or prompt_settle_seconds > 10:
+        raise ValueError("prompt_settle_seconds must be between 0.1 and 10")
+    re.compile(prompt_pattern)
+
+
+def validate_shell_commands(commands: list[str]) -> None:
+    if not commands:
+        raise ValueError("commands is required")
+    for command in commands:
+        validate_command_safety(command.strip())
+
+
+def shell_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def strip_interactive_echo_and_prompt(
+    raw: str, user_input: str, prompt: re.Pattern[str]
+) -> str:
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.splitlines()
+    if lines and lines[0].strip() == user_input.strip():
+        lines = lines[1:]
+    text = "\n".join(lines)
+    matches = list(prompt.finditer(text))
+    if matches:
+        text = text[: matches[-1].start()]
+    return text.strip()

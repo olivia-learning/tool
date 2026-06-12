@@ -170,6 +170,87 @@ def download_device_files(
     }
 
 
+def run_interactive_tool(
+    work_dir: str,
+    tool_command: str,
+    inputs: list[str],
+    prompt_pattern: str,
+    user_confirmed: bool = False,
+    startup_timeout: int = 30,
+    command_timeout: int = 30,
+    prompt_settle_seconds: float = 0.8,
+) -> dict[str, Any]:
+    if not user_confirmed:
+        return {
+            "ok": False,
+            "status": "needs_user_confirmation",
+            "message": "Show the working directory, tool command, prompt pattern, and inputs to the user first, then call again with user_confirmed=true after they approve it in chat.",
+        }
+
+    config = load_config()
+    secrets = CredentialStore().get_device_secrets(config)
+    with EmbeddedSSHSession(config, secrets) as session:
+        results = session.run_interactive_tool(
+            work_dir=work_dir,
+            tool_command=tool_command,
+            inputs=inputs,
+            prompt_pattern=prompt_pattern,
+            startup_timeout=startup_timeout,
+            command_timeout=command_timeout,
+            prompt_settle_seconds=prompt_settle_seconds,
+        )
+    return {
+        "ok": True,
+        "results": [
+            {
+                "input": item.input,
+                "output": item.output,
+                "duration_ms": item.duration_ms,
+                "truncated": item.truncated,
+            }
+            for item in results
+        ],
+    }
+
+
+def run_shell_commands(
+    commands: list[str],
+    user_confirmed: bool = False,
+    command_timeout: int = 30,
+) -> dict[str, Any]:
+    if not user_confirmed:
+        return {
+            "ok": False,
+            "status": "needs_user_confirmation",
+            "message": "Show the shell commands to the user first, then call again with user_confirmed=true after they approve them in chat.",
+        }
+
+    config = load_config()
+    secrets = CredentialStore().get_device_secrets(config)
+    with EmbeddedSSHSession(config, secrets) as session:
+        results = session.run_shell_commands(
+            commands=commands,
+            command_timeout=command_timeout,
+        )
+    return {
+        "ok": True,
+        "results": [
+            {
+                "command": item.command,
+                "output": item.stdout,
+                "stdout": item.stdout,
+                "stderr": item.stderr,
+                "exit_status": item.exit_status,
+                "success": item.exit_status == 0,
+                "duration_ms": item.duration_ms,
+                "truncated": item.truncated,
+            }
+            for item in results
+        ],
+        "note": "Commands run in an interactive shell; stderr is usually merged into output by the remote PTY.",
+    }
+
+
 def build_mcp_server():
     try:
         from mcp.server.fastmcp import FastMCP
@@ -187,6 +268,8 @@ def build_mcp_server():
     mcp.tool()(plan_diagnostic_task)
     mcp.tool()(run_approved_plan)
     mcp.tool()(download_device_files)
+    mcp.tool()(run_interactive_tool)
+    mcp.tool()(run_shell_commands)
     mcp.tool()(list_recent_runs)
     mcp.tool()(get_run_detail)
     return mcp
